@@ -1,56 +1,111 @@
-#  WinterFallX
+# WinterFallX
 
-An Autonomous Team Code Review and Repetitive Error Intelligence Platform natively integrated with the **Vectorize Hindsight Long-Term Cloud Memory Engine**.
+**An autonomous team code review and repetitive-error intelligence platform, built on the Vectorize Hindsight long-term cloud memory engine.**
 
-WINTERFALLX targets and breaks the stateless limitations inherent to standard AI code checkers. Instead of executing isolated, one-shot code reviews that drop context between execution loops, WINTERFALLX establishes a persistent, team-wide operational memory graph. It actively tracks corporate coding guidelines, common team mistakes, and organizational architectural conventions over indefinite durations—preventing developer personnel from debugging the exact same infrastructure anomalies twice. Simply a smart code review agent with a long-term memory that remembers, adapts and evolves with you. The more you or your team use it the more personalized and efficient it will become. 
-
----
-
-## ⚡ Technical Core Features
-
-- **Frontend User Interface:** Streamlit (Clean, monochrome Apple-inspired workspace canvas).
-- **Long-Term Memory Engine:** `hindsight-client` official Python SDK integration.
-- **Data Credential Layer:** High-security environment runtime secrets extraction (`HINDSIGHT_API_URL`, `HINDSIGHT_API_KEY`).
-- **Administrative Analytics Ledger:** Local SQLite cross-team database state tracking (`pipeline_logs.db`).
+Most AI code checkers are stateless: every review starts from zero. WinterFallX keeps a persistent, team-wide memory of coding standards, recurring mistakes, and architectural conventions, so your developers stop debugging the same problems twice. It is a code review agent that remembers, adapts, and evolves with you. The more your team uses it, the more personalized and efficient it becomes.
 
 ---
 
-## 🔁 User Workflows & Structural System Design
+## Tech Stack
 
-### 👨‍💻 1. Developer Sandbox Environment (Default State)
-- **Lazy Singleton Client Initialization:** The backend extracts the secured environment credentials maps inside Replit to lock down a persistent singleton instance handler bound straight to `https://vectorize.io`.
-- **Hindsight.recall() Verification:** When an engineering review pipeline triggers, the engine maps out a unique team-wide memory bank to run a full semantic contextual interrogation over the wire, matching active error traces against historical inputs.
-- **The Contextual Cache Hit:** If an engineering exception (such as a database token failure in `auth_middleware.py`, resource cleanup pointer leak in `db_pool.cpp`, or timeout drop in `stripe_payment.py`) matches a recorded history, the app renders a soft-green confirmation banner, details the organizational standard violated, logs the cross-user feedback count iteration, and applies the verified remediation code instantly.
-- **Hindsight.retain() Capture:** If a fault signature is completely unknown to the platform (Cache Miss), the app logs an unknown anomaly warning, runs a simulated progress loader bar, and executes a real cloud network `retain()` call—pasting the code snippets, metadata parameters, user IDs, and custom solutions straight into Vectorize's live cloud memory layer.
-
-### 🏢 2. Corporate Management Executive Dashboard
-- **Cross-Team Engagement Rankings:** Toggling the sidebar parameter updates the display into an executive analytics cockpit. It aggregates rows from the SQLite database to rank team profiles stacked vertically by their cumulative active engagement hour metrics.
-- **Granular Interaction Drill-Downs:** Management leaders can expand individual team modules to view active registered teammate profiles and audit a systemic anomaly matrix showing precisely which code file scripts are constantly crashing and which style guidelines are failing across the workspace history.
+| Layer | Technology |
+| --- | --- |
+| Frontend | [Streamlit](https://streamlit.io), a monochrome, Apple-inspired glass UI with light and dark modes |
+| Long-term memory | Hindsight Cloud via the official `hindsight-client` Python SDK (`retain` / `recall`) |
+| Analytics ledger | Local SQLite database (`pipeline_logs.db`) powering the executive dashboard |
+| Credentials | Environment secrets (`HINDSIGHT_API_URL`, `HINDSIGHT_API_KEY`) |
 
 ---
 
-## 🛠️ Step-by-Step Installation & Run Guide
+## How It Works
 
-### 1. Configure the Cloud Server Sandbox Workspace
-Ensure your system environment has Python active, then execute the installation command inside your terminal root folder to pull the official framework tools:
+### 1. Developer Sandbox (default view)
+
+1. **Recall.** When a review runs, the app queries the team's own memory bank (`winterfallx-<team>-memory`) with `Hindsight.recall()`, matching the current fault against past incidents by meaning rather than exact text.
+2. **Memory hit.** If the incident was seen before, the app shows a green confirmation banner, increments the team's repeat counter, and applies the previously verified remediation.
+3. **Memory miss.** If the fault is new, the app flags it, runs a short progress sequence, and calls `Hindsight.retain()` to store the incident, its context, and the resolution in the cloud memory bank for future reviews.
+
+Built-in demo scenarios:
+
+- `auth_middleware.py`: JWT validation bypass on a malformed header
+- `db_pool.cpp`: leaked pooled connection when a query throws
+- `stripe_payment.py`: webhook verification with no timeout budget
+
+### 2. Company Executive Dashboard
+
+Switch views from the sidebar to get a cross-team cockpit built from the SQLite ledger:
+
+- **Engagement ranking:** teams ordered from highest to lowest platform engagement.
+- **Team drill-downs:** expand a team to see its active developer IDs, preference footprint, and which files and standards keep failing.
+- **Management signal:** the most frequently repeated convention violation per team.
+
+### Accessibility
+
+A built-in accessibility menu offers dark mode, high contrast, larger text, and reduced motion.
+
+---
+
+## Getting Started
+
+### 1. Install dependencies
+
 ```bash
 pip install streamlit hindsight-client
 ```
 
-### 2. Configure Your Environment Secrets
-Before booting the application, ensure you have declared your secured target routing addresses and account keys inside your host machine or Replit secrets profile parameters:
-```env
-HINDSIGHT_API_URL="https://vectorize.io"
-HINDSIGHT_API_KEY="your_secret_vectorize_api_token"
+You need a recent version of Streamlit, since the app uses newer widget options such as `width="stretch"` on buttons. If you hit errors on an older install, upgrade with `pip install --upgrade streamlit`.
+
+### 2. Set your environment secrets
+
+Set these in your shell or in Replit Secrets before launching:
+
+```bash
+HINDSIGHT_API_URL="<your Hindsight API base URL>"
+HINDSIGHT_API_KEY="<your Hindsight API key>"
 ```
 
-### 3. Launch the Application Server Natively
-Execute the explicit Streamlit runner script command to bind the port and open up the interactive visual preview browser tab:
+Copy the base URL and API key from your Hindsight Cloud dashboard. The app raises a clear error at startup if either variable is missing.
+
+### 3. Add the theme config (recommended)
+
+Create `.streamlit/config.toml` in the project root so the light theme applies on every machine, regardless of browser or OS theme:
+
+```toml
+[theme]
+base = "light"
+primaryColor = "#000000"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#000000"
+```
+
+The folder name must start with a dot, and the server needs a restart after changes to this file.
+
+### 4. Run the app
+
 ```bash
 streamlit run Main.py --server.port 8501 --server.address 0.0.0.0
 ```
 
+Then open the preview in your browser.
+
 ---
 
+## Project Structure
+
+```
+.
+├── Main.py                  # Entire app: UI, Hindsight adapter, SQLite ledger
+├── pipeline_logs.db         # Auto-created local analytics ledger (seeded on first run)
+├── .streamlit/
+│   └── config.toml          # Theme settings
+└── README.md
+```
+
+## Notes
+
+- Hindsight is the memory of record. The local SQLite ledger only drives dashboard analytics and repeat-incident counts.
+- If a Hindsight call fails (network or quota), the app shows a warning and keeps working with the local ledger.
+- The dashboard's demo data is seeded automatically the first time the app runs.
 
 
