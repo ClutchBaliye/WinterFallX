@@ -2,8 +2,12 @@
 
 The app intentionally keeps the product surface in one file so it can be
 copied into a fresh Replit project and run with the requested Streamlit
-command. HindsightLedger mirrors the recall/retain contract locally with
-SQLite, which keeps the demo deterministic and useful without an API key.
+command. Memory is backed by the real Hindsight Cloud API (retain/recall),
+with a local SQLite ledger kept alongside it to power the dashboard's
+per-team analytics (feedback counts, affected files, engagement hours).
+
+Credentials are read from environment secrets:
+    HINDSIGHT_API_URL, HINDSIGHT_API_KEY
 """
 
 from __future__ import annotations
@@ -12,11 +16,13 @@ import hashlib
 import html
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
+from hindsight_client import Hindsight
 
 
 APP_NAME = "WINTERFALLX"
@@ -119,6 +125,29 @@ SEED_ROWS = [
 TEAM_HOURS = {"AlphaBuilders": 14.5, "DeltaCoders": 9.0, "Northstar Labs": 5.5}
 
 
+# ---------------------------------------------------------------------------
+# Hindsight client (real Cloud API, credentials come from environment secrets)
+# ---------------------------------------------------------------------------
+
+_hindsight_client: Hindsight | None = None
+
+
+def get_hindsight_client() -> Hindsight:
+    """Lazily build a singleton Hindsight client from environment secrets."""
+    global _hindsight_client
+    if _hindsight_client is None:
+        try:
+            base_url = os.environ["HINDSIGHT_API_URL"]
+            api_key = os.environ["HINDSIGHT_API_KEY"]
+        except KeyError as exc:
+            raise RuntimeError(
+                "Missing Hindsight credentials. Set HINDSIGHT_API_URL and "
+                "HINDSIGHT_API_KEY in Replit Secrets before running."
+            ) from exc
+        _hindsight_client = Hindsight(base_url=base_url, api_key=api_key)
+    return _hindsight_client
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -172,21 +201,51 @@ def row_signature(row: sqlite3.Row) -> str:
 
 
 class HindsightLedger:
-    """A small local adapter exposing the same operational shape as Hindsight."""
+    """Adapter around the real Hindsight Cloud API.
+
+    Hindsight (retain/recall) is the memory of record: it searches by
+    meaning (semantic, keyword, graph and temporal) rather than by exact hash.
+    The local SQLite table underneath is the data source for the executive
+    dashboard (feedback counts, affected files, per-team engagement) and for
+    repeat-incident bookkeeping. It is analytics, not memory.
+    """
 
     def __init__(self, bank_id: str):
         self.bank_id = bank_id
+        self.client = get_hindsight_client()
 
-    def recall(self, team_name: str, file_name: str, code_snippet: str, error_msg: str) -> sqlite3.Row | None:
+    def recall(
+        self, team_name: str, file_name: str, code_snippet: str, error_msg: str
+    ) -> tuple[sqlite3.Row | None, list[str]]:
+        query = f"{file_name}: {error_msg}"
+        memory_texts: list[str] = []
+        try:
+            result = self.client.recall(bank_id=self.bank_id, query=query)
+            memory_texts = [memory.text for memory in result.results]
+        except Exception as exc:  # network / quota / API failure path
+            st.warning(f"Hindsight recall failed, continuing with local ledger only: {exc}")
+
         target = signature_for(team_name, file_name, code_snippet, error_msg)
         with db_connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM incidents WHERE team_name = ? ORDER BY id DESC",
                 (team_name,),
             ).fetchall()
-        return next((row for row in rows if row_signature(row) == target), None)
+        matched = next((row for row in rows if row_signature(row) == target), None)
+        return matched, memory_texts
 
     def retain(self, payload: dict[str, Any]) -> int:
+        content = (
+            f"Team {payload['team_name']} (developer {payload['developer_id']}) hit an issue in "
+            f"{payload['file_name']}: {payload['error_msg']}. "
+            f"Standard violated: {payload['standard_violation']}. "
+            f"Resolution applied: {payload['resolution']}."
+        )
+        try:
+            self.client.retain(bank_id=self.bank_id, content=content)
+        except Exception as exc:  # network / quota / API failure path
+            st.warning(f"Hindsight retain failed, incident still logged locally: {exc}")
+
         with db_connection() as connection:
             cursor = connection.execute(
                 """
@@ -237,122 +296,330 @@ def preference_for(team_name: str, rows: list[sqlite3.Row]) -> str:
     return team_rows[0]["preference_flag"] or "prefer-explicit-remediation"
 
 
+# ---------------------------------------------------------------------------
+# Styling: black / white / gray-by-opacity only. Real color exists solely in
+# the four status dots. Light and dark mode swap the same CSS variables.
+# ---------------------------------------------------------------------------
+
 def inject_styles() -> None:
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,wght@0,400;0,700;1,400&family=DM+Mono:wght@400;500&family=Lobster...&family=Manrope:wght@400;500;600;700;800&display=swap');
-        :root { --ink: #101010; --muted: #767676; --line: #ececec; --soft: #f7f7f7; --shadow: 0 14px 40px rgba(0,0,0,.055); }
-        html, body, [class*="css"] { font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: var(--ink); }
-        .stApp { background: #fff; }
-        [data-testid="stAppViewContainer"] { background: #fff; }
-        [data-testid="stHeader"] { background: transparent !important; z-index:1000; }
-        [data-testid="stSidebar"] { background: #fafafa; border-right: 1px solid #f0f0f0; z-index:900 !important; }
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Lobster&family=Manrope:wght@400;500;600;700;800&display=swap');
+
+        :root {
+            --ink: #000000;
+            --paper: #ffffff;
+            --line: rgba(0,0,0,.08);
+            --line-strong: rgba(0,0,0,.16);
+            --muted: rgba(0,0,0,.58);
+            --muted-soft: rgba(0,0,0,.4);
+            --glass: rgba(255,255,255,.72);
+            --glass-strong: rgba(255,255,255,.88);
+            --sidebar-bg: rgba(236,236,236,.88);
+            --tint: rgba(0,0,0,.045);
+            --code-bg: #000000;
+            --code-fg: #ffffff;
+            --code-dim: rgba(255,255,255,.5);
+            --shadow: 0 20px 60px rgba(0,0,0,.07);
+            --shadow-soft: 0 8px 28px rgba(0,0,0,.05);
+            --radius-lg: 24px;
+            --radius-md: 16px;
+            --radius-sm: 12px;
+        }
+
+        html, body, [class*="css"] {
+            font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+            color: var(--ink);
+        }
+
+        /* Base surfaces */
+        .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] { background: var(--paper) !important; }
+        [data-testid="stHeader"] { background: transparent !important; z-index: 1000; }
+
+        /* Force Streamlit's own text to follow the variables (fixes white-on-white) */
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stMarkdownContainer"] :where(p, span, li, h1, h2, h3, h4, b, strong),
+        [data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] p,
+        [data-testid="stRadio"] label, [data-testid="stRadio"] label p,
+        [data-testid="stToggle"] label, [data-testid="stToggle"] p,
+        [data-testid="stExpander"] summary, [data-testid="stExpander"] summary p,
+        [data-testid="stSpinner"], [data-testid="stSpinner"] *,
+        [data-testid="stProgress"] p, [data-testid="stCaptionContainer"] {
+            color: var(--ink) !important;
+        }
+
+        /* Sidebar: a shade darker than the main page */
+        [data-testid="stSidebar"] {
+            background: var(--sidebar-bg) !important;
+            backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px);
+            border-right: 1px solid var(--line);
+        }
+        [data-testid="stSidebar"] > div:first-child, [data-testid="stSidebarContent"] { background: transparent !important; }
         [data-testid="stSidebar"] > div:first-child { padding: 2rem 1.25rem; }
+
         .block-container { max-width: 1440px; padding: 5.5rem 4.5rem 5rem; }
+
         h1, h2, h3, h4, p { letter-spacing: -.02em; }
         h1 { font-weight: 800; font-size: clamp(2.1rem, 3vw, 3.45rem); line-height: .98; letter-spacing: -.075em; margin: 0; }
         h2 { font-size: 1.4rem; font-weight: 800; margin: 0; }
         h3 { font-size: 1rem; font-weight: 800; margin: 0; }
-        .brand { display:flex; align-items:center; gap:.6rem; color:#111; }
-        .brand-mark { width:30px; height:30px; display:grid; place-items:center; color:#111; font:400 1.55rem/1 "Lobster", "Brush Script MT", "Segoe Script", cursive; letter-spacing:-.12em; }
-        .brand-name { color:#111; font:400 1.12rem/1 "Lobster", "Brush Script MT", "Segoe Script", cursive; letter-spacing:-.025em; }
-        .overlay-name { color: navyblue; font:900 1.12rem/1 "Monospace", Arial, sans-serif; letter-spacing:-.02em; }
-        .app-overlay { position:fixed; top:0; left:0; right:0; height:3.65rem; z-index:10000; display:flex; align-items:center; padding:0 1.35rem; background:rgba(255,255,255,.86); border-bottom:1px solid rgba(0,0,0,.07); backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px); pointer-events:none; }
-        .overlay-wordmark { display:flex; align-items:center; gap:.6rem; margin-left:0; color:#111; }
-        .overlay-wordmark b { display:grid; place-items:center; width:28px; height:28px; color:#111; font:400 1.7rem/1 "Lobster", "Brush Script MT", "Segoe Script", cursive; letter-spacing:-.12em; }
-        .overlay-context { color:#8b8b8b; font:500 .58rem 'DM Mono', monospace; letter-spacing:.13em; text-transform:uppercase; }
-        .eyebrow { color:#565656; font-size:.74rem; font-family:'DM Mono', monospace; text-transform:uppercase; letter-spacing:.16em; font-weight:600; margin-bottom:1.3rem; }
-        .subhead { color:#707070; line-height:1.6; font-size:.94rem; max-width:650px; margin-top:1rem; }
-        .hindsight-word { color:#111; font-weight:800; text-decoration:underline; text-decoration-thickness:2px; text-underline-offset:4px; }
-        .surface { background:#fff; border-radius:12px; box-shadow:var(--shadow); padding:1.45rem; border:1px solid #f5f5f5; }
-        .surface-tight { background:#fff; border-radius:12px; box-shadow:var(--shadow); padding:1.05rem 1.2rem; border:1px solid #f5f5f5; }
-        [data-testid="stVerticalBlockBorderWrapper"] { border:1px solid #f4f4f4; border-radius:12px; box-shadow:var(--shadow); padding:1.15rem; background:#fff; }
+
+        /* Brand: clean capital cursive W, no outline */
+        .brand { display:flex; align-items:center; gap:.65rem; }
+        .brand-mark {
+            display:inline-flex; align-items:center; justify-content:center;
+            width:auto; height:auto; background:none; border:0; border-radius:0;
+            font: 400 1.9rem/1 'Lobster', 'Brush Script MT', 'Segoe Script', cursive;
+            letter-spacing: -.02em; color: var(--ink) !important;
+        }
+        .brand-name { font-weight: 800; font-size: 1.02rem; letter-spacing: -.02em; color: var(--ink) !important; }
+        .overlay-name { font: 800 1rem/1 'Manrope', sans-serif; letter-spacing:-.02em; color: var(--ink) !important; }
+
+        /* Header bar: full width, above everything including the sidebar */
+        .app-overlay {
+            position:fixed; top:0; left:0; right:0; height:3.7rem; z-index:2147483000;
+            display:flex; align-items:center; padding:0 1.4rem;
+            background: var(--glass-strong); border-bottom:1px solid var(--line);
+            backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
+            pointer-events:none;
+        }
+        .overlay-wordmark { display:flex; align-items:center; gap:.6rem; }
+        .overlay-wordmark b {
+            display:inline-flex; align-items:center; justify-content:center;
+            width:auto; height:auto; background:none; border:0; border-radius:0;
+            font: 400 1.9rem/1 'Lobster', 'Brush Script MT', 'Segoe Script', cursive;
+            letter-spacing: -.02em; color: var(--ink) !important;
+        }
+        .overlay-context { color: var(--muted-soft) !important; font:500 .58rem 'DM Mono', monospace; letter-spacing:.13em; text-transform:uppercase; }
+
+        /* Typography helpers */
+        .eyebrow { color: var(--muted) !important; font-size:.74rem; font-family:'DM Mono', monospace; text-transform:uppercase; letter-spacing:.16em; font-weight:600; margin-bottom:1.3rem; }
+        .subhead { color: var(--muted) !important; line-height:1.6; font-size:.94rem; max-width:650px; margin-top:1rem; }
+        .hindsight-word { color: var(--ink) !important; font-weight:800; text-decoration:underline; text-decoration-thickness:2px; text-underline-offset:4px; }
+        .hero-sage { color: var(--ink) !important; font:800 clamp(2.1rem, 3vw, 3.45rem)/.98 'Manrope', sans-serif; letter-spacing:-.075em; margin:0 0 1.3rem; }
+        .surface-label { color: var(--muted) !important; text-transform:uppercase; font-family:'DM Mono',monospace; letter-spacing:.12em; font-size:.62rem; margin-bottom:.55rem; }
+        .status-line { display:flex; align-items:center; gap:.55rem; font-size:.78rem; color: var(--muted) !important; }
+        .status-line span { color: var(--muted) !important; }
+        .engine-note { color: var(--muted-soft) !important; font: .6rem 'DM Mono', monospace; margin-top:.65rem; }
+        .body-note { color: var(--muted) !important; font-size:.84rem; line-height:1.6; margin:.5rem 0 1.15rem; }
+        .alert-note { color: var(--muted) !important; font-size:.72rem; }
+        .code-pre { font: .74rem/1.7 'DM Mono', monospace; white-space: pre-wrap; color: var(--ink) !important; margin:.8rem 0 0; background: transparent !important; }
+
+        /* Translucent Apple-style cards */
+        .surface, .surface-tight, .metric-card, [data-testid="stVerticalBlockBorderWrapper"] {
+            background: var(--glass) !important;
+            backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+            border-radius: var(--radius-lg) !important;
+            box-shadow: var(--shadow-soft);
+            border: 1px solid var(--line) !important;
+        }
+        .surface { padding:1.5rem; }
+        .surface-tight { padding:1.1rem 1.25rem; border-radius: var(--radius-md) !important; }
+        .metric-card { padding:1.1rem 1.15rem; }
+        [data-testid="stVerticalBlockBorderWrapper"] { padding:1.2rem; }
         [data-testid="stVerticalBlockBorderWrapper"] > div { border:0; }
-        [data-testid="stTextInput"] input, [data-testid="stSelectbox"] > div { border-radius:9px; border-color:#ededed; background:#fafafa; }
-        [data-testid="stTextArea"] textarea { border-radius:9px; border:1px solid #243b53; background:#0d1b2a !important; color:#dbeafe !important; caret-color:#fff; font:500 .76rem/1.7 "DM Mono", monospace; }
-        [data-testid="stTextInput"] input:focus, [data-testid="stTextArea"] textarea:focus { border-color:#a9a9a9; box-shadow:0 0 0 1px #a9a9a9; }
-        .surface-label { color:#8b8b8b; text-transform:uppercase; font-family:'DM Mono',monospace; letter-spacing:.12em; font-size:.62rem; margin-bottom:.55rem; }
-        .status-line { display:flex; align-items:center; gap:.55rem; font-size:.78rem; color:#555; }
+
+        [data-testid="stExpander"] {
+            background: var(--glass) !important; border: 1px solid var(--line) !important;
+            border-radius: var(--radius-lg) !important; box-shadow: var(--shadow-soft);
+            overflow: hidden;
+        }
+        [data-testid="stExpander"] details, [data-testid="stExpander"] summary { background: transparent !important; }
+        [data-testid="stExpander"] svg { color: var(--ink) !important; fill: var(--ink) !important; }
+
+        /* Inputs */
+        [data-testid="stTextInput"] input, [data-baseweb="select"] > div {
+            border-radius: var(--radius-sm) !important;
+            border: 1px solid var(--line-strong) !important;
+            background: var(--paper) !important;
+            color: var(--ink) !important;
+        }
+        [data-baseweb="select"] * { color: var(--ink) !important; }
+        [data-baseweb="select"] svg { fill: var(--ink) !important; }
+        [data-baseweb="popover"], [data-baseweb="popover"] > div, [data-baseweb="menu"], [role="listbox"], [role="dialog"] {
+            background: var(--paper) !important; color: var(--ink) !important;
+            border-radius: var(--radius-md) !important; border: 1px solid var(--line) !important;
+        }
+        [data-baseweb="popover"] li, [data-baseweb="popover"] li *,
+        [data-baseweb="popover"] [role="option"], [data-baseweb="popover"] [role="option"] *,
+        [data-baseweb="popover"] [role="listbox"] *, [data-baseweb="popover"] [data-baseweb="menu"] *,
+        [data-baseweb="menu"] li, [data-baseweb="menu"] li *,
+        [role="listbox"] li, [role="listbox"] li *, [role="listbox"] [role="option"], [role="listbox"] [role="option"] * {
+            color: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important;
+            background: transparent !important; opacity: 1 !important;
+        }
+        [data-baseweb="popover"] li:hover, [data-baseweb="popover"] [role="option"]:hover,
+        [data-baseweb="popover"] [role="option"][aria-selected="true"], [role="listbox"] [role="option"]:hover {
+            background: var(--tint) !important;
+        }
+
+        [data-testid="stTextArea"] textarea {
+            border-radius: var(--radius-sm) !important;
+            border: 1px solid var(--line-strong) !important;
+            background: var(--code-bg) !important;
+            color: var(--code-fg) !important;
+            caret-color: var(--code-fg);
+            font: 500 .76rem/1.7 "DM Mono", monospace;
+        }
+        [data-testid="stTextInput"] input:focus, [data-testid="stTextArea"] textarea:focus, [data-baseweb="select"] > div:focus-within {
+            border-color: var(--ink) !important; box-shadow: 0 0 0 1px var(--ink) !important;
+        }
+
+        /* The only colors in the app: four Apple system dots */
         .dot { display:inline-block; width:8px; height:8px; border-radius:50%; flex:0 0 8px; }
-        .dot-red { background:#ef4f4f; box-shadow:0 0 0 4px #fff0f0; }
-        .dot-yellow { background:#e6b82c; box-shadow:0 0 0 4px #fff9e5; }
-        .dot-blue { background:#367eea; box-shadow:0 0 0 4px #edf4ff; }
-        .dot-green { background:#35ad67; box-shadow:0 0 0 4px #ecfbf2; }
-        .hero-row { display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; margin-bottom:2rem; }
-        .hero-meta { display:flex; gap:.5rem; align-items:center; padding-top:.2rem; color:#777; font-size:.72rem; font-family:'DM Mono',monospace; }
-        .stat-value { font-size:2rem; font-weight:800; letter-spacing:-.06em; margin:.1rem 0 .25rem; }
-        .stat-caption { font-size:.74rem; color:#777; }
+        .dot-red { background:#FF3B30; box-shadow:0 0 0 4px rgba(255,59,48,.14); }
+        .dot-yellow { background:#FFCC00; box-shadow:0 0 0 4px rgba(255,204,0,.16); }
+        .dot-blue { background:#007AFF; box-shadow:0 0 0 4px rgba(0,122,255,.14); }
+        .dot-green { background:#34C759; box-shadow:0 0 0 4px rgba(52,199,89,.14); }
+
+        .hero-row { display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; margin-bottom:2rem; padding-top:1rem; }
+        .hero-meta { display:flex; gap:.5rem; align-items:center; padding-top:.2rem; color: var(--muted) !important; font-size:.72rem; font-family:'DM Mono',monospace; }
+
+        .stat-value { font-size:2rem; font-weight:800; letter-spacing:-.06em; margin:.1rem 0 .25rem; color: var(--ink) !important; }
+        .stat-caption { font-size:.74rem; color: var(--muted) !important; }
         .stat-grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:.8rem; margin:1.4rem 0 1.8rem; }
-        .metric-card { padding:1.05rem 1.1rem; border-radius:12px; background:#fafafa; border:1px solid #f1f1f1; }
-        .metric-card .metric-kicker { color:#888; font-size:.65rem; text-transform:uppercase; letter-spacing:.1em; font-family:'DM Mono',monospace; }
-        .log-box { background:#111; color:#e8e8e8; border-radius:12px; padding:1rem 1.1rem; font-family:'DM Mono',monospace; font-size:.69rem; line-height:1.8; box-shadow:var(--shadow); }
-        .log-blue { color:#8cb4ff; } .log-green { color:#8ce1ab; } .log-red { color:#ff8e8e; } .log-muted { color:#989898; }
-        .alert { display:flex; align-items:flex-start; gap:.75rem; border-radius:12px; padding:1rem 1.1rem; margin:1rem 0; font-size:.82rem; line-height:1.5; }
-        .alert-green { background:#effaf2; color:#195d33; } .alert-red { background:#fff2f1; color:#7f2525; } .alert-yellow { background:#fff9e5; color:#6f5600; } .alert-blue { background:#eef5ff; color:#1d4e9b; }
-        .alert strong { display:block; font-weight:800; margin-bottom:.12rem; }
-        .code-label { display:flex; justify-content:space-between; align-items:center; margin:1.25rem 0 .45rem; color:#777; font-family:'DM Mono',monospace; font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; }
-        .tag { display:inline-flex; align-items:center; background:#f1f1f1; border-radius:100px; padding:.35rem .65rem; color:#5f5f5f; font-size:.68rem; font-family:'DM Mono',monospace; }
-        .tag-black { background:#111; color:#fff; }
+        .metric-card .metric-kicker { color: var(--muted) !important; font-size:.65rem; text-transform:uppercase; letter-spacing:.1em; font-family:'DM Mono',monospace; }
+
+        .log-box { background: var(--code-bg); border: 1px solid var(--line-strong); border-radius: var(--radius-md); padding:1rem 1.1rem; font-family:'DM Mono',monospace; font-size:.69rem; line-height:1.8; box-shadow: var(--shadow-soft); }
+        .log-box div { color: var(--code-fg) !important; }
+        .log-box .log-dim { color: var(--code-dim) !important; }
+
+        .alert { display:flex; align-items:flex-start; gap:.8rem; border-radius: var(--radius-md); padding:1.05rem 1.15rem; margin:1rem 0; font-size:.82rem; line-height:1.5; background: var(--glass) !important; border: 1px solid var(--line) !important; color: var(--ink) !important; }
+        .alert div { color: var(--ink) !important; }
+        .alert strong { display:block; font-weight:800; margin-bottom:.15rem; color: var(--ink) !important; }
+        .alert .dot { margin-top:.35rem; }
+
+        .code-label { display:flex; justify-content:space-between; align-items:center; margin:1.25rem 0 .45rem; color: var(--muted) !important; font-family:'DM Mono',monospace; font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; }
+        .code-label span { color: var(--muted) !important; }
+
+        .tag { display:inline-flex; align-items:center; background: var(--tint); border-radius:100px; padding:.35rem .7rem; color: var(--muted) !important; font-size:.68rem; font-family:'DM Mono',monospace; margin:.15rem .15rem .15rem 0; }
+        .tag-black { background: var(--ink); color: var(--paper) !important; }
+
         .team-header { display:flex; justify-content:space-between; align-items:center; gap:1rem; }
-        .team-name { font-size:1.1rem; font-weight:800; letter-spacing:-.04em; }
-        .team-meta { color:#888; font-size:.76rem; margin-top:.25rem; }
-        .engagement { background:#111; color:#fff; border-radius:8px; padding:.55rem .7rem; text-align:right; white-space:nowrap; }
-        .engagement small { display:block; color:#a9a9a9; font-size:.57rem; font-family:'DM Mono',monospace; text-transform:uppercase; letter-spacing:.08em; }
-        .engagement b { font-size:1.05rem; letter-spacing:-.05em; }
-        .section-rule { height:1px; background:#f0f0f0; margin:1.7rem 0; }
-        .sidebar-copy { color:#7f7f7f; font-size:.72rem; line-height:1.55; margin-top:.75rem; }
-        .legend-row { display:flex; align-items:center; gap:.6rem; color:#777; font-size:.68rem; margin:.55rem 0; }
-        .footer-note { color:#a0a0a0; text-align:center; font: .65rem 'DM Mono', monospace; margin-top:3rem; }
-        .hero-row { padding-top:1rem; }
-        .hero-sage { color:#111; font:400 clamp(2.1rem, 3vw, 3.45rem)/.98 "Sage", cursive; letter-spacing:-.075em; margin:0 0 1.3rem; }
+        .team-name { font-size:1.1rem; font-weight:800; letter-spacing:-.04em; color: var(--ink) !important; }
+        .team-meta { color: var(--muted) !important; font-size:.76rem; margin-top:.25rem; }
+        .engagement { background: var(--ink); border-radius:12px; padding:.6rem .8rem; text-align:right; white-space:nowrap; }
+        .engagement small { display:block; color: var(--paper) !important; opacity:.6; font-size:.57rem; font-family:'DM Mono',monospace; text-transform:uppercase; letter-spacing:.08em; }
+        .engagement b { color: var(--paper) !important; font-size:1.05rem; letter-spacing:-.05em; }
+
+        .section-rule { height:1px; background: var(--line); margin:1.7rem 0; }
+        .sidebar-copy { color: var(--muted) !important; font-size:.72rem; line-height:1.55; margin-top:.75rem; }
+        .legend-row { display:flex; align-items:center; gap:.6rem; color: var(--muted) !important; font-size:.68rem; margin:.55rem 0; }
+        .footer-note { color: var(--muted-soft) !important; text-align:center; font: .65rem 'DM Mono', monospace; margin-top:3rem; }
+
+        /* Table (custom HTML so light/dark both render correctly) */
+        .table-wrap { overflow-x:auto; }
+        .data-table { width:100%; border-collapse:collapse; font-size:.78rem; }
+        .data-table th { text-align:left; color: var(--muted) !important; font: 500 .62rem 'DM Mono', monospace; text-transform:uppercase; letter-spacing:.12em; padding:.55rem .6rem; border-bottom:1px solid var(--line-strong); }
+        .data-table td { color: var(--ink) !important; padding:.75rem .6rem; border-bottom:1px solid var(--line); }
+        .data-table tr:last-child td { border-bottom:0; }
+
+        /* Primary button: black text on white, pill, Apple-style */
+        button[data-testid="stBaseButton-primary"], .stButton > button[kind="primary"] {
+            background: var(--paper) !important;
+            color: var(--ink) !important;
+            border: 1px solid var(--line-strong) !important;
+            border-radius: 100px !important;
+            padding: .85rem 1.5rem !important;
+            font-weight: 700 !important;
+            letter-spacing: -.01em;
+            box-shadow: var(--shadow-soft) !important;
+            transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+        }
+        button[data-testid="stBaseButton-primary"] p, .stButton > button[kind="primary"] p { color: var(--ink) !important; }
+        button[data-testid="stBaseButton-primary"]:hover, .stButton > button[kind="primary"]:hover {
+            transform: translateY(-1px);
+            border-color: var(--ink) !important;
+            box-shadow: var(--shadow) !important;
+        }
+
+        /* Sidebar toggle: invisible click target sitting exactly on the header's cursive W */
         [data-testid="stSidebar"], [data-testid="stSidebar"] > div:first-child { transition:width .38s cubic-bezier(.2,.75,.2,1), transform .38s cubic-bezier(.2,.75,.2,1); }
-        [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"] { position:fixed !important; top:.42rem !important; left:1.15rem !important; z-index:10006 !important; }
-        [data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapsedControl"] button, button[aria-label="Close sidebar"], button[aria-label="Open sidebar"] { width:38px !important; height:38px !important; border-radius:50% !important; background:#fff !important; border:1px solid #111 !important; box-shadow:0 6px 18px rgba(0,0,0,.09) !important; padding:0 !important; }
-        [data-testid="stSidebarCollapseButton"] svg, [data-testid="stSidebarCollapsedControl"] svg, [data-testid="stSidebarCollapseButton"] [data-testid="stIconMaterial"], [data-testid="stSidebarCollapsedControl"] [data-testid="stIconMaterial"], button[aria-label="Close sidebar"] svg, button[aria-label="Open sidebar"] svg { display:none !important; }
-        [data-testid="stSidebarCollapseButton"] button::before, [data-testid="stSidebarCollapsedControl"] button::before, button[aria-label="Close sidebar"]::before, button[aria-label="Open sidebar"]::before { content:"W"; display:block; color:#fff; -webkit-text-stroke:1px #111; font:900 1rem Georgia, serif; line-height:1; }
-        [data-testid="stPopover"] { position:fixed !important; top:.42rem !important; right:2rem !important; left:auto !important; width:32px !important; height:32px !important; z-index:10006 !important; }
+        [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] {
+            position:fixed !important; top:.48rem !important; left:1.1rem !important;
+            z-index:2147483001 !important; visibility:visible !important; opacity:1 !important;
+        }
+        [data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapsedControl"] button, [data-testid="collapsedControl"] button,
+        button[aria-label="Close sidebar"], button[aria-label="Open sidebar"] {
+            width:44px !important; height:44px !important; border-radius:12px !important;
+            background: transparent !important; border:0 !important; outline:0 !important;
+            box-shadow:none !important; padding:0 !important; cursor:pointer;
+        }
+        [data-testid="stSidebarCollapseButton"] button:focus-visible, [data-testid="stSidebarCollapsedControl"] button:focus-visible, [data-testid="collapsedControl"] button:focus-visible {
+            outline: 2px solid var(--ink) !important; outline-offset: 2px;
+        }
+        [data-testid="stSidebarCollapseButton"] svg, [data-testid="stSidebarCollapsedControl"] svg, [data-testid="collapsedControl"] svg,
+        [data-testid="stSidebarCollapseButton"] [data-testid="stIconMaterial"], [data-testid="stSidebarCollapsedControl"] [data-testid="stIconMaterial"],
+        button[aria-label="Close sidebar"] svg, button[aria-label="Open sidebar"] svg { display:none !important; }
+        [data-testid="stSidebarCollapseButton"] button::before, [data-testid="stSidebarCollapsedControl"] button::before, [data-testid="collapsedControl"] button::before,
+        button[aria-label="Close sidebar"]::before, button[aria-label="Open sidebar"]::before { content:none !important; }
+
+        [data-testid="stPopover"] { position:fixed !important; top:.42rem !important; right:2rem !important; left:auto !important; width:32px !important; height:32px !important; z-index:2147483002 !important; }
         [data-testid="stPopover"] > div, [data-testid="stPopover"] button[data-testid="stPopoverButton"] { width:32px !important; height:32px !important; }
-        [data-testid="stPopover"] button[data-testid="stPopoverButton"] { padding:0 !important; border-radius:0 !important; border:0 !important; outline:0 !important; background:transparent !important; color:#111 !important; box-shadow:none !important; font-size:1rem !important; }
+        [data-testid="stPopover"] button[data-testid="stPopoverButton"] {
+            padding:0 !important; border-radius:0 !important; border:0 !important; outline:0 !important;
+            background:transparent !important; color: var(--ink) !important; box-shadow:none !important; font-size:1rem !important;
+        }
         [data-testid="stPopover"] button[data-testid="stPopoverButton"] p { display:none !important; }
-        [data-testid="stPopover"] button[data-testid="stPopoverButton"] [data-testid="stIconMaterial"] { color:#111 !important; font-size:1.3rem !important; }
+        [data-testid="stPopover"] button[data-testid="stPopoverButton"] [data-testid="stIconMaterial"] { color: var(--ink) !important; font-size:1.3rem !important; }
         [data-testid="stPopover"] button[data-testid="stPopoverButton"]:hover { transform:translateY(-1px); }
-        .accessibility-title { font-size:.95rem; font-weight:800; letter-spacing:-.03em; margin-bottom:.2rem; }
-        .accessibility-copy { color:#777; font-size:.72rem; line-height:1.5; margin-bottom:.8rem; }
-        @media (max-width: 900px) { .block-container { padding:5rem 1.1rem 4rem; } .hero-row { flex-direction:column; } .stat-grid { grid-template-columns:1fr; } .overlay-context { display:none; } [data-testid="stPopover"] { right:2rem !important; } }
+
+        .accessibility-title { font-size:.95rem; font-weight:800; letter-spacing:-.03em; margin-bottom:.2rem; color: var(--ink) !important; }
+        .accessibility-copy { color: var(--muted) !important; font-size:.72rem; line-height:1.5; margin-bottom:.8rem; }
+
+        @media (max-width: 900px) {
+            .block-container { padding:5rem 1.1rem 4rem; }
+            .hero-row { flex-direction:column; }
+            .stat-grid { grid-template-columns:1fr; }
+            .overlay-context { display:none; }
+            [data-testid="stPopover"] { right:2rem !important; }
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
     accessibility_css = []
     if st.session_state.get("accessibility_dark_mode", False):
+        # Same black/white palette, inverted. Only the variables change.
         accessibility_css.append(
             """
-            html, body, [class*="css"] { color:#f5f5f5 !important; }
-            .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"] { background:#101010 !important; }
-            [data-testid="stSidebar"] { background:#171717 !important; border-color:#2b2b2b !important; }
-            .app-overlay { background:rgba(16,16,16,.86); border-color:#2c2c2c; }
-            .overlay-wordmark, .overlay-wordmark b, .overlay-name, .brand-name, .brand-mark, .hero-sage, h1, h2, h3, .hindsight-word { color:#fff !important; }
-            .overlay-context, .subhead, .hero-meta, .team-meta, .stat-caption, .sidebar-copy, .legend-row, .status-line, .surface-label, .eyebrow { color:#aaa !important; }
-            .surface, .surface-tight, [data-testid="stVerticalBlockBorderWrapper"], .metric-card { background:#191919 !important; border-color:#2c2c2c !important; }
-            .surface p, .surface pre, .surface-tight, .metric-card, .team-name, .metric-kicker, .code-label, [data-testid="stWidgetLabel"] p, [data-testid="stRadio"] label, [data-testid="stToggle"] label, [data-testid="stToggle"] p, [role="dialog"] p { color:#f5f5f5 !important; }
-            [data-testid="stTextInput"] input, [data-testid="stSelectbox"] > div { background:#222 !important; color:#fff !important; border-color:#3a3a3a !important; }
-            [data-testid="stTextArea"] textarea { background:#0c2238 !important; color:#dbeafe !important; border-color:#315a7d !important; }
-            [data-testid="stSelectbox"] svg { color:#fff !important; }
-            [role="dialog"] { background:#191919 !important; color:#f5f5f5 !important; border-color:#3a3a3a !important; }
-            [data-testid="stPopover"] button[data-testid="stPopoverButton"] [data-testid="stIconMaterial"] { color:#fff !important; }
-            .section-rule { background:#2c2c2c; }
-            [data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapsedControl"] button, button[aria-label="Close sidebar"], button[aria-label="Open sidebar"] { background:#191919 !important; border-color:#fff !important; }
+            :root {
+                --ink: #ffffff;
+                --paper: #000000;
+                --line: rgba(255,255,255,.12);
+                --line-strong: rgba(255,255,255,.24);
+                --muted: rgba(255,255,255,.62);
+                --muted-soft: rgba(255,255,255,.42);
+                --glass: rgba(28,28,30,.72);
+                --glass-strong: rgba(18,18,20,.88);
+                --sidebar-bg: rgba(30,30,32,.92);
+                --tint: rgba(255,255,255,.08);
+                --code-bg: #1c1c1e;
+                --code-fg: #ffffff;
+                --code-dim: rgba(255,255,255,.5);
+                --shadow: 0 20px 60px rgba(0,0,0,.6);
+                --shadow-soft: 0 8px 28px rgba(0,0,0,.5);
+            }
+            [data-testid="stToggle"] [role="switch"], [data-baseweb="checkbox"] > div { border-color: var(--ink) !important; }
             """
         )
     if st.session_state.get("accessibility_high_contrast", False):
         accessibility_css.append(
-            """ .subhead, .status-line, .team-meta, .stat-caption, .sidebar-copy, .legend-row { color:#333 !important; } .surface, .surface-tight, [data-testid="stVerticalBlockBorderWrapper"], .metric-card { border:2px solid #111 !important; } """
+            """
+            :root { --muted: var(--ink); --muted-soft: var(--ink); --line: var(--ink); --line-strong: var(--ink); }
+            .surface, .surface-tight, .metric-card, .alert, [data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"] { border: 2px solid var(--ink) !important; }
+            """
         )
     if st.session_state.get("accessibility_large_text", False):
-        accessibility_css.append(""" .subhead { font-size:1.08rem; } .status-line, .team-meta, .stat-caption { font-size:.9rem; } """)
+        accessibility_css.append(
+            """ .subhead { font-size:1.08rem; } .status-line, .team-meta, .stat-caption, .legend-row, .sidebar-copy { font-size:.9rem; } .data-table { font-size:.92rem; } """
+        )
     if st.session_state.get("accessibility_reduce_motion", False):
-        accessibility_css.append(""" *, *::before, *::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; } """)
+        accessibility_css.append(
+            """ *, *::before, *::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; } """
+        )
     if accessibility_css:
         st.markdown("<style>" + "".join(accessibility_css) + "</style>", unsafe_allow_html=True)
 
@@ -385,11 +652,11 @@ def sidebar() -> str:
             )
         st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
         st.markdown(
-            '<div class="status-line"><span class="dot dot-green"></span><span>Ledger online · SQLite local</span></div>',
+            '<div class="status-line"><span class="dot dot-green"></span><span>Ledger online · Hindsight Cloud</span></div>',
             unsafe_allow_html=True,
         )
         st.markdown(
-            '<div style="color:#a0a0a0;font: .6rem DM Mono, monospace;margin-top:.65rem"><span class="hindsight-word">Hindsight</span> ENGINE / v0.9.4</div>',
+            '<div class="engine-note"><span class="hindsight-word">Hindsight</span> ENGINE / cloud</div>',
             unsafe_allow_html=True,
         )
     return mode
@@ -456,17 +723,17 @@ def run_review(team_name: str, developer_id: str, selected: str, code_snippet: s
     scenario = SCENARIOS[selected]
     bank_id = f"winterfallx-{team_name.strip()}-memory"
     ledger = HindsightLedger(bank_id)
-    existing = ledger.recall(team_name, scenario["file"], code_snippet, scenario["error"])
+    existing, memory_texts = ledger.recall(team_name, scenario["file"], code_snippet, scenario["error"])
     log_lines = [
-        f"Hindsight.recall() called for bank_id: {bank_id}...",
-        f"→ searching semantic ledger / signature {signature_for(team_name, scenario['file'], code_snippet, scenario['error'])[:12]}",
+        f"Hindsight.recall(bank_id='{bank_id}', query='{scenario['file']}: {scenario['error']}')",
+        f"→ {len(memory_texts)} memory match(es) returned from Hindsight Cloud",
     ]
     if existing:
         repeat_count = ledger.increment_repeat(existing["id"])
         log_lines.extend(
             [
-                f"→ context match found in incident #{existing['id']} / confidence 0.98",
-                f"Hindsight.retain() skipped — prior resolution promoted (repeat count: {repeat_count})",
+                f"→ context match found in incident #{existing['id']}",
+                f"→ Hindsight.retain() skipped, prior resolution promoted (repeat count: {repeat_count})",
             ]
         )
         return {
@@ -481,9 +748,8 @@ def run_review(team_name: str, developer_id: str, selected: str, code_snippet: s
 
     log_lines.extend(
         [
-            "→ context match found: 0",
-            "→ unknown fault pattern routed to synthesis layer",
-            f"Hindsight.retain() queued for {bank_id}",
+            "→ no matching incident on record for this team",
+            f"→ Hindsight.retain(bank_id='{bank_id}') storing this incident as a new memory",
         ]
     )
     incident_id = ledger.retain(
@@ -513,12 +779,7 @@ def run_review(team_name: str, developer_id: str, selected: str, code_snippet: s
 def render_logs(lines: list[str], kind: str) -> None:
     output = []
     for line in lines:
-        if "recall" in line or "searching" in line:
-            cls = "log-blue"
-        elif "retain" in line or "match found" in line:
-            cls = "log-green" if kind == "hit" else "log-red"
-        else:
-            cls = "log-muted"
+        cls = "log-dim" if line.startswith("→") else ""
         output.append(f'<div class="{cls}">{html.escape(line)}</div>')
     st.markdown(f'<div class="log-box">{"".join(output)}</div>', unsafe_allow_html=True)
 
@@ -528,10 +789,10 @@ def render_review_result(result: dict[str, Any]) -> None:
     if result["kind"] == "hit":
         st.markdown(
             f"""
-            <div class="alert alert-green"><span class="dot dot-green"></span><div>
-                <strong>[HINDSIGHT MEMORY CACHE HIT]</strong>
-                Successfully retrieved context from historical team memory bank. Applying prior reviewer feedback to prevent redundant human cycles.
-                <br><span style="font-size:.72rem">This convention mistake has repeated <b>{result['repeat_count']} times</b> across the team workspace.</span>
+            <div class="alert"><span class="dot dot-green"></span><div>
+                <strong>Memory match found</strong>
+                Retrieved context from this team's Hindsight memory bank and applied the prior resolution.
+                <br><span class="alert-note">This convention mistake has repeated <b>{result['repeat_count']} times</b> across the team workspace.</span>
             </div></div>
             """,
             unsafe_allow_html=True,
@@ -539,9 +800,9 @@ def render_review_result(result: dict[str, Any]) -> None:
     else:
         st.markdown(
             """
-            <div class="alert alert-red"><span class="dot dot-red"></span><div>
-                <strong>Unknown fault pattern · Hindsight search returned 0 context matches.</strong>
-                Executing LLM synthesis, then retaining the new team standard in the local ledger.
+            <div class="alert"><span class="dot dot-red"></span><div>
+                <strong>No prior match on record</strong>
+                Hindsight search returned no matching context. Retaining this incident as a new team memory.
             </div></div>
             """,
             unsafe_allow_html=True,
@@ -549,6 +810,7 @@ def render_review_result(result: dict[str, Any]) -> None:
         progress = st.progress(0, text="Synthesizing fault context…")
         for value, text in [(32, "Mapping failure surface…"), (68, "Comparing team conventions…"), (100, "Retaining learned preference…")]:
             progress.progress(value, text=text)
+            time.sleep(0.25)
 
     st.markdown('<div class="eyebrow" style="margin-top:1.55rem">Review synthesis</div>', unsafe_allow_html=True)
     st.markdown(
@@ -556,7 +818,7 @@ def render_review_result(result: dict[str, Any]) -> None:
         <div class="surface">
             <div class="surface-label">What went wrong & where</div>
             <h3>{html.escape(scenario['file'])}</h3>
-            <p style="color:#666;font-size:.84rem;line-height:1.6;margin:.5rem 0 1.15rem">{html.escape(scenario['error'])}</p>
+            <p class="body-note">{html.escape(scenario['error'])}</p>
             <div class="tag"><span class="dot dot-yellow" style="margin-right:.45rem"></span>{html.escape(scenario['violation'])}</div>
         </div>
         """,
@@ -566,7 +828,7 @@ def render_review_result(result: dict[str, Any]) -> None:
         f"""
         <div class="surface" style="margin-top:1rem">
             <div class="surface-label">Refactored remediation code</div>
-            <pre style="font: .74rem/1.7 'DM Mono',monospace;white-space:pre-wrap;color:#252525;margin:.8rem 0 0">{html.escape(result['resolution'])}</pre>
+            <pre class="code-pre">{html.escape(result['resolution'])}</pre>
         </div>
         """,
         unsafe_allow_html=True,
@@ -665,6 +927,22 @@ def team_summary(team_name: str, rows: list[sqlite3.Row]) -> tuple[float, list[s
     return hours, team_rows
 
 
+def render_feedback_table(team_rows: list[sqlite3.Row]) -> None:
+    body = "".join(
+        f"<tr><td>{html.escape(row['file_name'])}</td><td>{html.escape(row['standard_violation'])}</td><td>{int(row['feedback_count'])}</td></tr>"
+        for row in sorted(team_rows, key=lambda item: int(item["feedback_count"]), reverse=True)
+    )
+    st.markdown(
+        f"""
+        <div class="table-wrap"><table class="data-table">
+            <thead><tr><th>File surface</th><th>Standard at risk</th><th>Feedback loops</th></tr></thead>
+            <tbody>{body}</tbody>
+        </table></div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def executive_view() -> None:
     rows = all_rows()
     teams = sorted({row["team_name"] for row in rows}, key=lambda name: team_summary(name, rows)[0], reverse=True)
@@ -696,20 +974,16 @@ def executive_view() -> None:
                 st.markdown('<div class="surface-label" style="margin-top:1.25rem">Preference footprint</div>', unsafe_allow_html=True)
                 preferences = sorted({row["preference_flag"] for row in team_rows if row["preference_flag"]})
                 for pref in preferences:
-                    st.markdown(f'<div class="tag" style="margin:.15rem .15rem .15rem 0">{html.escape(pref)}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="tag">{html.escape(pref)}</div>', unsafe_allow_html=True)
             with col_b:
                 st.markdown('<div class="surface-label">Systemic feedback loop repetition</div>', unsafe_allow_html=True)
                 violations: dict[str, int] = {}
                 for row in team_rows:
                     violations[row["standard_violation"]] = violations.get(row["standard_violation"], 0) + int(row["feedback_count"])
-                table_rows = [
-                    {"File surface": row["file_name"], "Standard at risk": row["standard_violation"], "Feedback loops": int(row["feedback_count"])}
-                    for row in sorted(team_rows, key=lambda item: int(item["feedback_count"]), reverse=True)
-                ]
-                st.dataframe(table_rows, width="stretch", hide_index=True)
+                render_feedback_table(team_rows)
                 highest = max(violations.items(), key=lambda item: item[1])
                 st.markdown(
-                    f'<div class="alert alert-yellow"><span class="dot dot-yellow"></span><div><strong>Management signal</strong>{html.escape(highest[0])} is the dominant repeated convention with {highest[1]} feedback events.</div></div>',
+                    f'<div class="alert"><span class="dot dot-yellow"></span><div><strong>Management signal</strong>{html.escape(highest[0])} is the dominant repeated convention with {highest[1]} feedback events.</div></div>',
                     unsafe_allow_html=True,
                 )
     total_repeats = sum(max(0, int(row["feedback_count"]) - 1) for row in rows)
@@ -741,3 +1015,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
